@@ -155,6 +155,7 @@
           <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
             <button class="btn ghost small" onclick="addItem('material')">+ Material / COG item</button>
             <button class="btn ghost small" onclick="addItem('labor')">+ Labor item (hours)</button>
+            <button class="btn ghost small" onclick="addItem('contractor')">+ Contractor flat fee</button>
           </div>
           <div style="margin-top:8px;">
             <button class="btn ghost small" onclick="applyLaborRateToAll()">Apply standard rate to all labor items</button>
@@ -190,6 +191,9 @@
           <div class="row"><span>Labor markup %</span>
             <input id="f-laborMarkup" type="number" min="0" max="100" style="width:64px;text-align:right;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;padding:3px 6px;" />
           </div>
+          <div class="row"><span>Contractor fee markup %</span>
+            <input id="f-contractorMarkup" type="number" min="0" max="100" style="width:64px;text-align:right;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;padding:3px 6px;" />
+          </div>
           <div class="row"><span>Overhead / profit %</span>
             <input id="f-overheadPct" type="number" min="0" max="100" style="width:64px;text-align:right;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;padding:3px 6px;" />
           </div>
@@ -200,6 +204,8 @@
           <div class="row dim"><span>Materials + markup</span><span id="s-cogMarked">$0.00</span></div>
           <div class="row dim"><span>Labor (base)</span><span id="s-laborBase">$0.00</span></div>
           <div class="row dim"><span>Labor + markup</span><span id="s-laborMarked">$0.00</span></div>
+          <div class="row dim"><span>Contractor fee (base)</span><span id="s-contractorBase">$0.00</span></div>
+          <div class="row dim"><span>Contractor fee + markup</span><span id="s-contractorMarked">$0.00</span></div>
 
           <hr />
           <div class="row"><span>Subtotal</span><span id="s-subtotal">$0.00</span></div>
@@ -264,7 +270,7 @@ function emptyQuote() {
     date: new Date().toISOString().slice(0,10),
     notes: "",
     preparedBy: currentUser ? currentUser.id : null,
-    cogMarkup: 25, laborMarkup: 25, overheadPct: 30, laborRate: 25,
+    cogMarkup: 25, laborMarkup: 25, contractorMarkup: 15, overheadPct: 30, laborRate: 25,
     items: [
       { id: crypto.randomUUID(), type: "material", description: "", qty: 1, unitCost: 0 },
     ],
@@ -552,6 +558,7 @@ function renderQuote() {
   document.getElementById("f-laborRate").value = quote.laborRate;
   document.getElementById("f-cogMarkup").value = quote.cogMarkup;
   document.getElementById("f-laborMarkup").value = quote.laborMarkup;
+  document.getElementById("f-contractorMarkup").value = quote.contractorMarkup;
   document.getElementById("f-overheadPct").value = quote.overheadPct;
   const sel = document.getElementById("f-preparedBy");
   if (quote.preparedBy && [...sel.options].some(o => o.value === quote.preparedBy)) {
@@ -570,7 +577,7 @@ function bindFieldListeners() {
       quote[f] = e.target.value;
     });
   });
-  ["cogMarkup","laborMarkup","overheadPct","laborRate"].forEach(f => {
+  ["cogMarkup","laborMarkup","contractorMarkup","overheadPct","laborRate"].forEach(f => {
     document.getElementById("f-"+f).addEventListener("input", e => {
       quote[f] = Number(e.target.value) || 0;
       recalc();
@@ -617,6 +624,7 @@ function renderItems() {
       <select data-role="type">
         <option value="material" ${it.type==="material"?"selected":""}>Material</option>
         <option value="labor" ${it.type==="labor"?"selected":""}>Labor</option>
+        <option value="contractor" ${it.type==="contractor"?"selected":""}>Contractor</option>
       </select>
       <input data-role="description" placeholder="Description" value="${escapeHtml(it.description)}" />
       <input data-role="qty" type="number" min="0" step="0.1" value="${it.qty}" style="text-align:center" />
@@ -650,9 +658,11 @@ function recalc() {
 
   const cogBase = quote.items.filter(i=>i.type==="material").reduce((s,i)=>s+i.qty*i.unitCost,0);
   const laborBase = quote.items.filter(i=>i.type==="labor").reduce((s,i)=>s+i.qty*i.unitCost,0);
+  const contractorBase = quote.items.filter(i=>i.type==="contractor").reduce((s,i)=>s+i.qty*i.unitCost,0);
   const cogMarked = cogBase * (1 + (quote.cogMarkup||0)/100);
   const laborMarked = laborBase * (1 + (quote.laborMarkup||0)/100);
-  const subtotal = cogMarked + laborMarked;
+  const contractorMarked = contractorBase * (1 + (quote.contractorMarkup||0)/100);
+  const subtotal = cogMarked + laborMarked + contractorMarked;
   const overhead = subtotal * ((quote.overheadPct||0)/100);
   const total = subtotal + overhead;
 
@@ -660,11 +670,13 @@ function recalc() {
   document.getElementById("s-cogMarked").textContent = currency(cogMarked);
   document.getElementById("s-laborBase").textContent = currency(laborBase);
   document.getElementById("s-laborMarked").textContent = currency(laborMarked);
+  document.getElementById("s-contractorBase").textContent = currency(contractorBase);
+  document.getElementById("s-contractorMarked").textContent = currency(contractorMarked);
   document.getElementById("s-subtotal").textContent = currency(subtotal);
   document.getElementById("s-overhead").textContent = currency(overhead);
   document.getElementById("s-total").textContent = currency(total);
 
-  return { cogBase, laborBase, cogMarked, laborMarked, subtotal, overhead, total };
+  return { cogBase, laborBase, contractorBase, cogMarked, laborMarked, contractorMarked, subtotal, overhead, total };
 }
 
 // ---------- EXPORT ----------
@@ -752,7 +764,7 @@ function exportPDF() {
       doc.rect(margin, y, pageWidth - margin * 2, 20, "F");
     }
     doc.setTextColor(30, 30, 30);
-    doc.text(it.type === "material" ? "Material" : "Labor", margin + 8, y + 14);
+    doc.text(it.type === "material" ? "Material" : it.type === "labor" ? "Labor" : "Contractor", margin + 8, y + 14);
     doc.text((it.description || "").slice(0, 44), margin + 70, y + 14);
     doc.text(String(it.qty), margin + 330, y + 14);
     doc.text(currency(it.unitCost), margin + 380, y + 14);
@@ -769,6 +781,8 @@ function exportPDF() {
     [`Materials + ${quote.cogMarkup}% markup`, currency(totals.cogMarked)],
     ["Labor (base)", currency(totals.laborBase)],
     [`Labor + ${quote.laborMarkup}% markup`, currency(totals.laborMarked)],
+    ["Contractor fee (base)", currency(totals.contractorBase)],
+    [`Contractor fee + ${quote.contractorMarkup}% markup`, currency(totals.contractorMarked)],
   ];
   doc.setFontSize(10);
   rows.forEach(([k, v]) => {
@@ -826,7 +840,7 @@ function exportExcel() {
   rows.push(["Type", "Description", "Qty", "Unit Cost", "Line Total"]);
   quote.items.forEach(it => {
     rows.push([
-      it.type === "material" ? "Material" : "Labor",
+      it.type === "material" ? "Material" : it.type === "labor" ? "Labor" : "Contractor",
       it.description || "",
       it.qty,
       Number(it.unitCost.toFixed(2)),
@@ -838,6 +852,8 @@ function exportExcel() {
   rows.push([`Materials + ${quote.cogMarkup}% markup`, "", "", "", Number(totals.cogMarked.toFixed(2))]);
   rows.push(["Labor (base)", "", "", "", Number(totals.laborBase.toFixed(2))]);
   rows.push([`Labor + ${quote.laborMarkup}% markup`, "", "", "", Number(totals.laborMarked.toFixed(2))]);
+  rows.push(["Contractor fee (base)", "", "", "", Number(totals.contractorBase.toFixed(2))]);
+  rows.push([`Contractor fee + ${quote.contractorMarkup}% markup`, "", "", "", Number(totals.contractorMarked.toFixed(2))]);
   rows.push(["Subtotal", "", "", "", Number(totals.subtotal.toFixed(2))]);
   rows.push([`Overhead / profit (${quote.overheadPct}%)`, "", "", "", Number(totals.overhead.toFixed(2))]);
   rows.push(["TOTAL", "", "", "", Number(totals.total.toFixed(2))]);
@@ -872,6 +888,7 @@ async function saveQuote() {
       notes: quote.notes,
       cog_markup: quote.cogMarkup,
       labor_markup: quote.laborMarkup,
+      contractor_markup: quote.contractorMarkup,
       overhead_pct: quote.overheadPct,
       labor_rate: quote.laborRate,
     };
@@ -945,7 +962,7 @@ async function loadQuote(id) {
     clientName: q.client_name, address: q.address, phone: q.phone,
     date: q.quote_date, notes: q.notes,
     preparedBy: q.created_by,
-    cogMarkup: q.cog_markup, laborMarkup: q.labor_markup, overheadPct: q.overhead_pct, laborRate: q.labor_rate ?? 25,
+    cogMarkup: q.cog_markup, laborMarkup: q.labor_markup, contractorMarkup: q.contractor_markup ?? 15, overheadPct: q.overhead_pct, laborRate: q.labor_rate ?? 25,
     items: (items||[]).map(i => ({ id: crypto.randomUUID(), type: i.item_type, description: i.description, qty: Number(i.qty), unitCost: Number(i.unit_cost) })),
   };
   if (!quote.items.length) quote.items = [{ id: crypto.randomUUID(), type: "material", description: "", qty: 1, unitCost: 0 }];
