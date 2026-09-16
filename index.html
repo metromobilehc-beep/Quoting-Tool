@@ -215,8 +215,11 @@
 
           <button class="btn" style="width:100%;margin-top:16px;" onclick="saveQuote()">Save Quote</button>
           <div style="display:flex;gap:8px;margin-top:8px;">
-            <button class="btn secondary" style="flex:1;border-color:rgba(255,255,255,0.3);" onclick="exportPDF()">Export PDF</button>
-            <button class="btn secondary" style="flex:1;border-color:rgba(255,255,255,0.3);" onclick="exportExcel()">Export Excel</button>
+            <button class="btn secondary" style="flex:1;border-color:rgba(255,255,255,0.3);" onclick="exportPDF()">Internal PDF</button>
+            <button class="btn secondary" style="flex:1;border-color:rgba(255,255,255,0.3);" onclick="exportExcel()">Internal Excel</button>
+          </div>
+          <div style="margin-top:8px;">
+            <button class="btn" style="width:100%;background:var(--amber);" onclick="exportClientPDF()">Export Client-Facing PDF</button>
           </div>
           <div id="save-status" class="status"></div>
         </div>
@@ -824,6 +827,138 @@ function exportPDF() {
   }
 
   doc.save(exportFilenameBase() + ".pdf");
+}
+
+function exportClientPDF() {
+  // Client-facing export: shows itemized work and a bottom-line total only.
+  // Every line's price already has markup folded in — no base cost, no
+  // markup %, and no overhead/profit line are ever shown to the client.
+  const totals = recalc();
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
+  const TEAL = [21, 76, 71];
+  const ORANGE = [244, 75, 26];
+  const GREY = [130, 130, 130];
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const margin = 50;
+  let y = 56;
+
+  // Header
+  doc.setFillColor(...TEAL);
+  doc.rect(0, 0, pageWidth, 6, "F");
+  doc.setFont("times", "bold");
+  doc.setFontSize(20);
+  doc.setTextColor(...TEAL);
+  doc.text("Metro Mobile Health Care", margin, y);
+  y += 20;
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(11);
+  doc.setTextColor(...GREY);
+  doc.text("Aging in Place — Service Quote", margin, y);
+  y += 30;
+
+  // Client info block
+  doc.setDrawColor(224, 221, 213);
+  doc.line(margin, y, pageWidth - margin, y);
+  y += 20;
+  doc.setFontSize(10);
+  const infoLeft = [
+    ["Client", quote.clientName || "—"],
+    ["Address", quote.address || "—"],
+    ["Phone", quote.phone || "—"],
+  ];
+  const infoRight = [
+    ["Date", quote.date || "—"],
+    ["Prepared By", preparedByName() || "—"],
+  ];
+  let ly = y, ry = y;
+  infoLeft.forEach(([k, v]) => {
+    doc.setTextColor(...GREY); doc.text(k + ":", margin, ly);
+    doc.setTextColor(30, 30, 30); doc.text(String(v), margin + 70, ly);
+    ly += 16;
+  });
+  infoRight.forEach(([k, v]) => {
+    doc.setTextColor(...GREY); doc.text(k + ":", margin + 300, ry);
+    doc.setTextColor(30, 30, 30); doc.text(String(v), margin + 380, ry);
+    ry += 16;
+  });
+  y = Math.max(ly, ry) + 14;
+
+  // Build client-facing line items: each item's displayed price already
+  // includes that category's markup — no separate cost/markup columns.
+  const markupFor = (type) => type === "material" ? quote.cogMarkup
+    : type === "labor" ? quote.laborMarkup
+    : quote.contractorMarkup;
+  const overheadMultiplier = 1 + (quote.overheadPct || 0) / 100;
+  const clientLines = quote.items
+    .filter(it => (it.description || "").trim() !== "")
+    .map(it => {
+      // Markup + overhead both folded in here so the line items always sum
+      // exactly to the printed Total — nothing left to back-calculate from.
+      const clientUnitPrice = it.unitCost * (1 + (markupFor(it.type) || 0) / 100) * overheadMultiplier;
+      return {
+        description: it.description,
+        qty: it.qty,
+        lineTotal: it.qty * clientUnitPrice,
+      };
+    });
+
+  // Line items table header — no per-unit cost column, just description/qty/amount
+  doc.setFillColor(21, 76, 71);
+  doc.rect(margin, y, pageWidth - margin * 2, 22, "F");
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(9);
+  doc.setFont("helvetica", "bold");
+  doc.text("DESCRIPTION", margin + 8, y + 15);
+  doc.text("QTY", margin + 380, y + 15);
+  doc.text("AMOUNT", pageWidth - margin - 8, y + 15, { align: "right" });
+  y += 22;
+
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9.5);
+  clientLines.forEach((it, idx) => {
+    if (y > 700) { doc.addPage(); y = 56; }
+    if (idx % 2 === 0) {
+      doc.setFillColor(247, 245, 240);
+      doc.rect(margin, y, pageWidth - margin * 2, 20, "F");
+    }
+    doc.setTextColor(30, 30, 30);
+    doc.text((it.description || "").slice(0, 62), margin + 8, y + 14);
+    doc.text(String(it.qty), margin + 380, y + 14);
+    doc.text(currency(it.lineTotal), pageWidth - margin - 8, y + 14, { align: "right" });
+    y += 20;
+  });
+
+  y += 24;
+  if (y > 680) { doc.addPage(); y = 56; }
+
+  // Bottom line only — no subtotal, no overhead/profit, no markup shown
+  doc.setDrawColor(...ORANGE);
+  doc.setLineWidth(1.2);
+  doc.line(pageWidth - margin - 220, y - 14, pageWidth - margin, y - 14);
+  doc.setFont("times", "bold");
+  doc.setFontSize(15);
+  doc.setTextColor(...ORANGE);
+  doc.text("Total", pageWidth - margin - 220, y + 6);
+  doc.text(currency(totals.total), pageWidth - margin - 8, y + 6, { align: "right" });
+  y += 34;
+
+  // Notes
+  if (quote.notes) {
+    if (y > 680) { doc.addPage(); y = 56; }
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10);
+    doc.setTextColor(...TEAL);
+    doc.text("Notes", margin, y);
+    y += 14;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    doc.setTextColor(60, 60, 60);
+    const split = doc.splitTextToSize(quote.notes, pageWidth - margin * 2);
+    doc.text(split, margin, y);
+  }
+
+  doc.save(exportFilenameBase() + "-client.pdf");
 }
 
 function exportExcel() {
