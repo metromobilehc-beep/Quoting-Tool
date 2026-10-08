@@ -83,6 +83,15 @@
   .saved-item .meta{font-size:11px;color:#999;}
   .saved-item .name{font-size:13px;}
   .hidden{display:none !important;}
+  .modal-backdrop{position:fixed;inset:0;background:rgba(20,30,30,.55);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50;}
+  .modal{background:#fff;border-radius:12px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;box-shadow:0 10px 40px rgba(0,0,0,.25);}
+  .modal h3{font-family:Georgia,serif;color:var(--teal-dark);margin:0 0 4px;font-size:20px;}
+  .inv-total{display:flex;justify-content:space-between;padding:6px 0;font-size:14px;}
+  .inv-total.big{font-family:Georgia,serif;font-size:20px;color:var(--orange);border-top:1px solid var(--line);margin-top:6px;padding-top:10px;}
+  .badge{display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:999px;background:#eee;color:#555;}
+  .badge.sent{background:#e6f1fb;color:#185fa5;}
+  .badge.paid{background:#e3f4ea;color:#1d7a46;}
+  .badge.void{background:#f6e3e0;color:#a33;}
   @media(max-width:760px){
     .layout{grid-template-columns:1fr;}
     .grid2{grid-template-columns:1fr;}
@@ -221,7 +230,15 @@
           <div style="margin-top:8px;">
             <button class="btn" style="width:100%;background:var(--amber);" onclick="exportClientPDF()">Export Client-Facing PDF</button>
           </div>
+          <div style="margin-top:8px;">
+            <button class="btn" style="width:100%;background:#fff;color:var(--teal-dark);" onclick="openInvoiceModal()">Create Invoice →</button>
+          </div>
           <div id="save-status" class="status"></div>
+        </div>
+
+        <div class="card" style="margin-top:20px;">
+          <div class="section-title">Invoices</div>
+          <div id="invoice-list"><div class="saved-item"><span class="meta">Save a quote to see its invoices.</span></div></div>
         </div>
 
         <div class="card" style="margin-top:20px;">
@@ -229,6 +246,46 @@
           <div id="saved-list"><div class="saved-item">Loading...</div></div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- INVOICE MODAL -->
+  <div id="invoice-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeInvoiceModal()">
+    <div class="modal">
+      <h3>Create Invoice</h3>
+      <div style="font-size:12px;color:#888;margin-bottom:16px;">Built from the current quote. Prices shown to the client include all markup — no cost breakdown is ever printed.</div>
+      <div class="grid2">
+        <div><label>Invoice #</label><input id="inv-number" /></div>
+        <div><label>Terms</label>
+          <select id="inv-terms" onchange="invTermsChanged()">
+            <option value="0">Due on receipt</option>
+            <option value="15">Net 15</option>
+            <option value="30">Net 30</option>
+            <option value="custom">Custom date</option>
+          </select>
+        </div>
+        <div><label>Issue date</label><input id="inv-issue" type="date" onchange="invTermsChanged()" /></div>
+        <div><label>Due date</label><input id="inv-due" type="date" /></div>
+        <div><label>Deposit / amount already paid ($)</label><input id="inv-paid" type="number" min="0" step="0.01" value="0" oninput="invRefreshTotals()" /></div>
+        <div><label>Project / job reference (optional)</label><input id="inv-ref" placeholder="e.g. Bathroom grab bars" /></div>
+        <div class="full"><label>Payment instructions</label>
+          <textarea id="inv-payment" rows="3"></textarea>
+        </div>
+        <div class="full"><label>Invoice notes (optional)</label>
+          <textarea id="inv-notes" rows="2" placeholder="Thank you for choosing Metro Mobile Health Care."></textarea>
+        </div>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="inv-total"><span>Quote total</span><span id="inv-t-total">$0.00</span></div>
+        <div class="inv-total"><span>Less paid</span><span id="inv-t-paid">$0.00</span></div>
+        <div class="inv-total big"><span>Balance due</span><span id="inv-t-bal">$0.00</span></div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:18px;flex-wrap:wrap;">
+        <button class="btn" onclick="submitInvoice(true)">Save &amp; Download PDF</button>
+        <button class="btn secondary" style="color:var(--teal-dark);border-color:var(--teal-dark);" onclick="submitInvoice(false)">Save only</button>
+        <button class="btn ghost" onclick="closeInvoiceModal()">Cancel</button>
+      </div>
+      <div id="inv-status" class="status"></div>
     </div>
   </div>
 
@@ -572,6 +629,7 @@ function renderQuote() {
   }
   renderItems();
   recalc();
+  loadInvoices();
 }
 
 function bindFieldListeners() {
@@ -1108,6 +1166,333 @@ async function deleteQuote(id) {
   await sb.from("quotes").delete().eq("id", id);
   if (quote.id === id) newQuote();
   loadSavedList();
+}
+
+// ---------- INVOICES ----------
+const DEFAULT_PAYMENT_INSTRUCTIONS =
+  "Make checks payable to Metro Mobile Health Care, PLLC and mail to 6153 S Quebec Ave, Tulsa, OK 74136.\nQuestions about this invoice? Visit metromobilehc.com.";
+let invoiceCache = []; // invoices for the open quote
+
+function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+
+// Client-facing lines: markup + overhead folded into each line, rounded to
+// cents so the printed lines always sum exactly to the printed total.
+function buildClientLines() {
+  const markupFor = (type) => type === "material" ? quote.cogMarkup
+    : type === "labor" ? quote.laborMarkup
+    : quote.contractorMarkup;
+  const overheadMultiplier = 1 + (quote.overheadPct || 0) / 100;
+  const lines = quote.items
+    .filter(it => (it.description || "").trim() !== "")
+    .map(it => ({
+      description: it.description,
+      qty: it.qty,
+      amount: round2(it.qty * it.unitCost * (1 + (markupFor(it.type) || 0) / 100) * overheadMultiplier),
+    }));
+  const total = round2(lines.reduce((s, l) => s + l.amount, 0));
+  return { lines, total };
+}
+
+function addDays(isoDate, days) {
+  const d = new Date(isoDate + "T12:00:00");
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso + "T12:00:00");
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+async function nextInvoiceNumber() {
+  // Sequential per company, starting at INV-1001. Falls back to a date-based
+  // number if the invoices table isn't reachable.
+  try {
+    const { data, error } = await sb.from("quote_invoices")
+      .select("invoice_number")
+      .eq("company_id", METRO_COMPANY_ID)
+      .order("created_at", { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    const nums = (data || []).map(r => parseInt(String(r.invoice_number).replace(/\D/g, ""), 10)).filter(Number.isFinite);
+    return "INV-" + (nums.length ? Math.max(...nums) + 1 : 1001);
+  } catch (e) {
+    return "INV-" + new Date().toISOString().slice(2, 10).replace(/-/g, "") + "-" + Math.floor(Math.random() * 90 + 10);
+  }
+}
+
+async function openInvoiceModal() {
+  const { lines, total } = buildClientLines();
+  const st = document.getElementById("inv-status");
+  st.textContent = ""; st.className = "status";
+  if (!lines.length || total <= 0) {
+    alert("Add at least one priced line item with a description before creating an invoice.");
+    return;
+  }
+  if (!(quote.clientName || "").trim()) {
+    alert("Enter a client name before creating an invoice.");
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  document.getElementById("inv-number").value = await nextInvoiceNumber();
+  document.getElementById("inv-issue").value = today;
+  document.getElementById("inv-terms").value = "0";
+  document.getElementById("inv-due").value = today;
+  document.getElementById("inv-paid").value = 0;
+  document.getElementById("inv-ref").value = "";
+  document.getElementById("inv-payment").value = DEFAULT_PAYMENT_INSTRUCTIONS;
+  document.getElementById("inv-notes").value = "";
+  invRefreshTotals();
+  document.getElementById("invoice-modal").classList.remove("hidden");
+}
+
+function closeInvoiceModal() {
+  document.getElementById("invoice-modal").classList.add("hidden");
+}
+
+function invTermsChanged() {
+  const terms = document.getElementById("inv-terms").value;
+  const issue = document.getElementById("inv-issue").value;
+  if (terms !== "custom" && issue) {
+    document.getElementById("inv-due").value = addDays(issue, Number(terms));
+  }
+}
+
+function invRefreshTotals() {
+  const { total } = buildClientLines();
+  const paid = round2(document.getElementById("inv-paid").value);
+  document.getElementById("inv-t-total").textContent = currency(total);
+  document.getElementById("inv-t-paid").textContent = paid ? "−" + currency(paid) : currency(0);
+  document.getElementById("inv-t-bal").textContent = currency(Math.max(total - paid, 0));
+}
+
+async function submitInvoice(download) {
+  const st = document.getElementById("inv-status");
+  const { lines, total } = buildClientLines();
+  const inv = {
+    invoice_number: document.getElementById("inv-number").value.trim(),
+    issue_date: document.getElementById("inv-issue").value,
+    due_date: document.getElementById("inv-due").value,
+    terms: document.getElementById("inv-terms").selectedOptions[0].textContent,
+    amount_total: total,
+    amount_paid: round2(document.getElementById("inv-paid").value),
+    reference: document.getElementById("inv-ref").value.trim(),
+    payment_instructions: document.getElementById("inv-payment").value.trim(),
+    notes: document.getElementById("inv-notes").value.trim(),
+    lines,
+    client_name: quote.clientName,
+    client_address: quote.address,
+    client_phone: quote.phone,
+  };
+  if (!inv.invoice_number || !inv.issue_date || !inv.due_date) {
+    st.textContent = "Invoice #, issue date and due date are required."; st.className = "status err"; return;
+  }
+  if (inv.amount_paid > inv.amount_total) {
+    st.textContent = "Amount paid can't exceed the total."; st.className = "status err"; return;
+  }
+  st.textContent = "Saving..."; st.className = "status";
+  try {
+    if (!quote.id) await saveQuote();
+    if (!quote.id) throw new Error("Save the quote first, then try again.");
+    const status = inv.amount_paid >= inv.amount_total ? "paid" : "sent";
+    const { error } = await sb.from("quote_invoices").insert({
+      company_id: METRO_COMPANY_ID,
+      quote_id: quote.id,
+      created_by: currentUser.id,
+      invoice_number: inv.invoice_number,
+      issue_date: inv.issue_date,
+      due_date: inv.due_date,
+      terms: inv.terms,
+      amount_total: inv.amount_total,
+      amount_paid: inv.amount_paid,
+      status,
+      reference: inv.reference,
+      payment_instructions: inv.payment_instructions,
+      notes: inv.notes,
+      lines: inv.lines,
+      client_name: inv.client_name,
+      client_address: inv.client_address,
+      client_phone: inv.client_phone,
+    });
+    if (error) throw error;
+    if (download) exportInvoicePDF(inv);
+    closeInvoiceModal();
+    loadInvoices();
+  } catch (e) {
+    st.textContent = "Couldn't save invoice — " + (e.message || "try again"); st.className = "status err";
+  }
+}
+
+function exportInvoicePDF(inv) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
+  const TEAL = [21, 76, 71], ORANGE = [244, 75, 26], GREY = [130, 130, 130], INK = [30, 30, 30];
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const margin = 50;
+  const right = pageWidth - margin;
+  let y = 56;
+
+  const drawTableHead = () => {
+    doc.setFillColor(...TEAL);
+    doc.rect(margin, y, pageWidth - margin * 2, 22, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(9);
+    doc.text("DESCRIPTION", margin + 8, y + 15);
+    doc.text("QTY", margin + 380, y + 15);
+    doc.text("AMOUNT", right - 8, y + 15, { align: "right" });
+    y += 22;
+  };
+
+  // Header band + company block
+  doc.setFillColor(...TEAL);
+  doc.rect(0, 0, pageWidth, 6, "F");
+  doc.setFont("times", "bold"); doc.setFontSize(20); doc.setTextColor(...TEAL);
+  doc.text("Metro Mobile Health Care", margin, y);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...GREY);
+  doc.text("6153 S Quebec Ave, Tulsa, OK 74136", margin, y + 15);
+  doc.text("metromobilehc.com", margin, y + 28);
+
+  // INVOICE title + meta (right)
+  doc.setFont("times", "bold"); doc.setFontSize(26); doc.setTextColor(...ORANGE);
+  doc.text("INVOICE", right, y, { align: "right" });
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+  const meta = [["Invoice #", inv.invoice_number], ["Issued", fmtDate(inv.issue_date)], ["Due", fmtDate(inv.due_date)], ["Terms", inv.terms]];
+  let my = y + 18;
+  meta.forEach(([k, v]) => {
+    doc.setTextColor(...GREY); doc.text(k + ":", right - 150, my);
+    doc.setTextColor(...INK); doc.text(String(v), right, my, { align: "right" });
+    my += 14;
+  });
+  y = Math.max(y + 44, my) + 14;
+
+  // Bill to
+  doc.setDrawColor(224, 221, 213);
+  doc.line(margin, y, right, y);
+  y += 20;
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...TEAL);
+  doc.text("BILL TO", margin, y);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(10.5); doc.setTextColor(...INK);
+  y += 16;
+  [inv.client_name, inv.client_address, inv.client_phone].filter(Boolean).forEach(line => {
+    doc.text(String(line), margin, y); y += 14;
+  });
+  if (inv.reference) {
+    doc.setTextColor(...GREY); doc.text("Re:", margin, y);
+    doc.setTextColor(...INK); doc.text(String(inv.reference), margin + 24, y);
+    y += 14;
+  }
+  y += 14;
+
+  // Line items
+  drawTableHead();
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+  inv.lines.forEach((it, idx) => {
+    if (y > 690) { doc.addPage(); y = 56; drawTableHead(); doc.setFont("helvetica", "normal"); doc.setFontSize(9.5); }
+    if (idx % 2 === 0) {
+      doc.setFillColor(247, 245, 240);
+      doc.rect(margin, y, pageWidth - margin * 2, 20, "F");
+    }
+    doc.setTextColor(...INK);
+    doc.text(String(it.description || "").slice(0, 62), margin + 8, y + 14);
+    doc.text(String(it.qty), margin + 380, y + 14);
+    doc.text(currency(it.amount), right - 8, y + 14, { align: "right" });
+    y += 20;
+  });
+
+  // Totals
+  y += 20;
+  if (y > 640) { doc.addPage(); y = 56; }
+  const balance = Math.max(round2(inv.amount_total - inv.amount_paid), 0);
+  const labelX = right - 220;
+  doc.setFont("helvetica", "normal"); doc.setFontSize(10);
+  doc.setTextColor(...GREY); doc.text("Total", labelX, y);
+  doc.setTextColor(...INK); doc.text(currency(inv.amount_total), right - 8, y, { align: "right" });
+  y += 16;
+  if (inv.amount_paid > 0) {
+    doc.setTextColor(...GREY); doc.text("Paid / deposit", labelX, y);
+    doc.setTextColor(...INK); doc.text("-" + currency(inv.amount_paid), right - 8, y, { align: "right" });
+    y += 16;
+  }
+  doc.setDrawColor(...ORANGE); doc.setLineWidth(1.2);
+  doc.line(labelX, y - 6, right, y - 6);
+  y += 14;
+  doc.setFont("times", "bold"); doc.setFontSize(15); doc.setTextColor(...ORANGE);
+  doc.text(balance === 0 ? "PAID IN FULL" : "Balance Due", labelX, y);
+  doc.text(currency(balance), right - 8, y, { align: "right" });
+  y += 40;
+
+  // Payment instructions + notes
+  const block = (title, text) => {
+    if (!text) return;
+    if (y > 680) { doc.addPage(); y = 56; }
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...TEAL);
+    doc.text(title, margin, y); y += 14;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9.5); doc.setTextColor(60, 60, 60);
+    const split = doc.splitTextToSize(text, pageWidth - margin * 2);
+    doc.text(split, margin, y);
+    y += split.length * 12 + 14;
+  };
+  if (balance > 0) block("How to pay", inv.payment_instructions);
+  block("Notes", inv.notes);
+
+  const slug = (inv.client_name || "client").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  doc.save(`${inv.invoice_number}-${slug || "client"}.pdf`);
+}
+
+async function loadInvoices() {
+  const el = document.getElementById("invoice-list");
+  if (!quote || !quote.id) {
+    invoiceCache = [];
+    el.innerHTML = `<div class="saved-item"><span class="meta">Save a quote to see its invoices.</span></div>`;
+    return;
+  }
+  const { data, error } = await sb.from("quote_invoices").select("*")
+    .eq("quote_id", quote.id).order("created_at", { ascending: false });
+  if (error) { el.innerHTML = `<div class="saved-item"><span class="meta">Couldn't load invoices.</span></div>`; return; }
+  invoiceCache = data || [];
+  if (!invoiceCache.length) { el.innerHTML = `<div class="saved-item"><span class="meta">No invoices for this quote yet.</span></div>`; return; }
+  el.innerHTML = "";
+  invoiceCache.forEach(r => {
+    const bal = Math.max(round2(r.amount_total - r.amount_paid), 0);
+    const row = document.createElement("div");
+    row.className = "saved-item";
+    row.style.flexWrap = "wrap";
+    row.innerHTML = `
+      <div style="flex:1;min-width:0;">
+        <div class="name">${escapeHtml(r.invoice_number)} <span class="badge ${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></div>
+        <div class="meta">Due ${fmtDate(r.due_date)} · ${currency(Number(r.amount_total))} · Bal ${currency(bal)}</div>
+      </div>
+      <div style="display:flex;gap:4px;">
+        <button class="btn ghost small" onclick="redownloadInvoice('${r.id}')">PDF</button>
+        ${r.status === "void" || r.status === "paid" ? "" : `<button class="btn ghost small" onclick="markInvoicePaid('${r.id}')">Mark paid</button>`}
+        ${r.status === "void" ? "" : `<button class="btn ghost small" onclick="voidInvoice('${r.id}')">Void</button>`}
+      </div>`;
+    el.appendChild(row);
+  });
+}
+
+function redownloadInvoice(id) {
+  const r = invoiceCache.find(x => x.id === id);
+  if (!r) return;
+  exportInvoicePDF({ ...r, amount_total: Number(r.amount_total), amount_paid: Number(r.amount_paid), lines: r.lines || [] });
+}
+
+async function markInvoicePaid(id) {
+  const r = invoiceCache.find(x => x.id === id);
+  if (!r || !confirm(`Mark ${r.invoice_number} as paid in full (${currency(Number(r.amount_total))})?`)) return;
+  const { error } = await sb.from("quote_invoices")
+    .update({ status: "paid", amount_paid: r.amount_total, paid_at: new Date().toISOString() }).eq("id", id);
+  if (error) { alert("Couldn't update invoice — " + error.message); return; }
+  loadInvoices();
+}
+
+async function voidInvoice(id) {
+  const r = invoiceCache.find(x => x.id === id);
+  if (!r || !confirm(`Void ${r.invoice_number}? It stays on record but is no longer collectible.`)) return;
+  const { error } = await sb.from("quote_invoices").update({ status: "void" }).eq("id", id);
+  if (error) { alert("Couldn't void invoice — " + error.message); return; }
+  loadInvoices();
 }
 
 // ---------- INIT ----------
