@@ -275,6 +275,10 @@
         <div class="full"><label>Invoice notes (optional)</label>
           <textarea id="inv-notes" rows="2" placeholder="Thank you for choosing Metro Mobile Health Care."></textarea>
         </div>
+        <div class="full" style="display:flex;align-items:center;gap:8px;">
+          <input id="inv-paylink" type="checkbox" checked style="width:auto;" />
+          <label for="inv-paylink" style="margin:0;font-size:13px;color:var(--ink);">Add an online payment link (card or bank) for the balance due</label>
+        </div>
       </div>
       <div style="margin-top:14px;">
         <div class="inv-total"><span>Quote total</span><span id="inv-t-total">$0.00</span></div>
@@ -1279,6 +1283,7 @@ async function openInvoiceModal() {
   document.getElementById("inv-ref").value = "";
   document.getElementById("inv-payment").value = DEFAULT_PAYMENT_INSTRUCTIONS;
   document.getElementById("inv-notes").value = "";
+  document.getElementById("inv-paylink").checked = true;
   invRefreshTotals();
   document.getElementById("invoice-modal").classList.remove("hidden");
 }
@@ -1332,7 +1337,7 @@ async function submitInvoice(download) {
     if (!quote.id) await saveQuote();
     if (!quote.id) throw new Error("Save the quote first, then try again.");
     const status = inv.amount_paid >= inv.amount_total ? "paid" : "sent";
-    const { error } = await sb.from("quote_invoices").insert({
+    const { data: saved, error } = await sb.from("quote_invoices").insert({
       company_id: METRO_COMPANY_ID,
       quote_id: quote.id,
       created_by: currentUser.id,
@@ -1350,11 +1355,24 @@ async function submitInvoice(download) {
       client_name: inv.client_name,
       client_address: inv.client_address,
       client_phone: inv.client_phone,
-    });
+    }).select("id").single();
     if (error) throw error;
+
+    // Optional Stripe pay link. The invoice is already saved, so a failure here
+    // never loses it — you can retry from the Invoices list.
+    let linkWarning = "";
+    if (status !== "paid" && document.getElementById("inv-paylink").checked) {
+      try {
+        const res = await fnApi("invoice-pay", "create", { invoice_id: saved.id });
+        inv.pay_url = res.url;
+      } catch (e) {
+        linkWarning = "Invoice saved, but the payment link couldn't be created: " + e.message;
+      }
+    }
     if (download) exportInvoicePDF(inv);
     closeInvoiceModal();
     loadInvoices();
+    if (linkWarning) alert(linkWarning + "\n\nYou can retry with 'Create pay link' in the Invoices list.");
   } catch (e) {
     st.textContent = "Couldn't save invoice — " + (e.message || "try again"); st.className = "status err";
   }
@@ -1469,7 +1487,16 @@ function exportInvoicePDF(inv) {
     doc.text(split, margin, y);
     y += split.length * 12 + 14;
   };
-  if (balance > 0) block("How to pay", inv.payment_instructions);
+  if (balance > 0 && inv.pay_url) {
+    if (y > 680) { doc.addPage(); y = 56; }
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...TEAL);
+    doc.text("Pay online (card or bank)", margin, y); y += 16;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9.5); doc.setTextColor(0, 102, 204);
+    const urlLines = doc.splitTextToSize(inv.pay_url, pageWidth - margin * 2);
+    urlLines.forEach(l => { doc.textWithLink(l, margin, y, { url: inv.pay_url }); y += 12; });
+    y += 14;
+  }
+  if (balance > 0) block(inv.pay_url ? "Or pay by check" : "How to pay", inv.payment_instructions);
   block("Notes", inv.notes);
 
   const slug = (inv.client_name || "client").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
@@ -1501,6 +1528,10 @@ async function loadInvoices() {
       </div>
       <div style="display:flex;gap:4px;">
         <button class="btn ghost small" onclick="redownloadInvoice('${r.id}')">PDF</button>
+        ${r.status === "void" || r.status === "paid" ? "" :
+          (r.stripe_payment_link_url
+            ? `<button class="btn ghost small" onclick="copyPayLink('${r.id}', this)">Copy pay link</button>`
+            : `<button class="btn ghost small" onclick="createPayLink('${r.id}', this)">Create pay link</button>`)}
         ${r.status === "void" || r.status === "paid" ? "" : `<button class="btn ghost small" onclick="markInvoicePaid('${r.id}')">Mark paid</button>`}
         ${r.status === "void" ? "" : `<button class="btn ghost small" onclick="voidInvoice('${r.id}')">Void</button>`}
       </div>`;
@@ -1511,14 +1542,45 @@ async function loadInvoices() {
 function redownloadInvoice(id) {
   const r = invoiceCache.find(x => x.id === id);
   if (!r) return;
-  exportInvoicePDF({ ...r, amount_total: Number(r.amount_total), amount_paid: Number(r.amount_paid), lines: r.lines || [] });
+  exportInvoicePDF({ ...r, amount_total: Number(r.amount_total), amount_paid: Number(r.amount_paid), lines: r.lines || [],
+    pay_url: r.status === "sent" ? r.stripe_payment_link_url : null });
+}
+
+async function createPayLink(id, btn) {
+  const r = invoiceCache.find(x => x.id === id);
+  if (!r) return;
+  if (btn) { btn.disabled = true; btn.textContent = "Creating..."; }
+  try {
+    const res = await fnApi("invoice-pay", "create", { invoice_id: id });
+    try { await navigator.clipboard.writeText(res.url); } catch (_) {}
+    alert(`Pay link created and copied for ${r.invoice_number}:\n\n${res.url}\n\nRe-download the PDF to include it.`);
+    loadInvoices();
+  } catch (e) {
+    alert("Couldn't create pay link — " + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = "Create pay link"; }
+  }
+}
+
+async function copyPayLink(id, btn) {
+  const r = invoiceCache.find(x => x.id === id);
+  if (!r || !r.stripe_payment_link_url) return;
+  try { await navigator.clipboard.writeText(r.stripe_payment_link_url); btn.textContent = "Copied!"; setTimeout(() => { btn.textContent = "Copy pay link"; }, 1500); }
+  catch (_) { prompt("Copy this link:", r.stripe_payment_link_url); }
+}
+
+// Best-effort: turn off a live Stripe link so a voided / already-paid invoice can't be paid again.
+async function deactivatePayLink(id) {
+  const r = invoiceCache.find(x => x.id === id);
+  if (!r || !r.stripe_payment_link_id) return;
+  try { await fnApi("invoice-pay", "deactivate", { invoice_id: id }); } catch (e) { console.error("deactivate link:", e); }
 }
 
 async function markInvoicePaid(id) {
   const r = invoiceCache.find(x => x.id === id);
   if (!r || !confirm(`Mark ${r.invoice_number} as paid in full (${currency(Number(r.amount_total))})?`)) return;
+  await deactivatePayLink(id); // so the client can't also pay online
   const { error } = await sb.from("quote_invoices")
-    .update({ status: "paid", amount_paid: r.amount_total, paid_at: new Date().toISOString() }).eq("id", id);
+    .update({ status: "paid", amount_paid: r.amount_total, paid_at: new Date().toISOString(), paid_via: "manual" }).eq("id", id);
   if (error) { alert("Couldn't update invoice — " + error.message); return; }
   loadInvoices();
 }
@@ -1526,6 +1588,7 @@ async function markInvoicePaid(id) {
 async function voidInvoice(id) {
   const r = invoiceCache.find(x => x.id === id);
   if (!r || !confirm(`Void ${r.invoice_number}? It stays on record but is no longer collectible.`)) return;
+  await deactivatePayLink(id);
   const { error } = await sb.from("quote_invoices").update({ status: "void" }).eq("id", id);
   if (error) { alert("Couldn't void invoice — " + error.message); return; }
   loadInvoices();
@@ -1537,8 +1600,10 @@ async function voidInvoice(id) {
 // never touches auth.users directly.
 let staffAdminRows = [];
 
-async function staffApi(action, payload) {
-  const { data, error } = await sb.functions.invoke("staff-admin", { body: { action, ...payload } });
+const staffApi = (action, payload) => fnApi("staff-admin", action, payload);
+
+async function fnApi(fn, action, payload) {
+  const { data, error } = await sb.functions.invoke(fn, { body: { action, ...payload } });
   if (error) {
     let msg = error.message || "Request failed";
     try { const j = await error.context.json(); if (j && j.error) msg = j.error; } catch (_) {}
