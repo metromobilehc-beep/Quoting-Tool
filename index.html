@@ -134,6 +134,7 @@
     </div>
     <div class="right">
       <span id="who"></span>
+      <button id="nav-staff-btn" class="btn secondary hidden" onclick="showStaffView()">Staff</button>
       <button id="nav-admin-btn" class="btn secondary hidden" onclick="showAdminView()">Catalog Admin</button>
       <button class="btn secondary" onclick="showQuoteView(); newQuote();">New Quote</button>
       <button class="btn secondary" onclick="logout()">Sign Out</button>
@@ -286,6 +287,29 @@
         <button class="btn ghost" onclick="closeInvoiceModal()">Cancel</button>
       </div>
       <div id="inv-status" class="status"></div>
+    </div>
+  </div>
+
+  <!-- STAFF VIEW (admin only) -->
+  <div id="staff-view" class="wrap hidden">
+    <button class="btn ghost small" style="margin-bottom:16px;" onclick="showQuoteView()">← Back to Quote</button>
+    <div class="card">
+      <div class="section-title">Add Staff Login</div>
+      <div style="font-size:12px;color:#888;margin-bottom:12px;">
+        Creates a login for a team member (Metro or the Stay Safe Home Solutions crew). You'll get a temporary password to pass along — shown once.
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:2;min-width:160px;"><label>Full name</label><input id="st-name" placeholder="First Last" /></div>
+        <div style="flex:2;min-width:180px;"><label>Email (their login)</label><input id="st-email" type="email" placeholder="name@example.com" /></div>
+        <div style="flex:1;min-width:130px;"><label>Phone</label><input id="st-phone" type="tel" placeholder="918-555-0100" /></div>
+        <button class="btn" onclick="addStaffMember()">Create Login</button>
+      </div>
+      <div id="st-status" class="status"></div>
+      <div id="st-credentials" class="hidden" style="margin-top:12px;padding:12px 14px;border:1px solid var(--teal-light);border-radius:8px;background:#f1faf9;font-size:13px;"></div>
+    </div>
+    <div class="card">
+      <div class="section-title">Staff</div>
+      <div id="staff-admin-list"><div class="saved-item"><span class="meta">Loading...</span></div></div>
     </div>
   </div>
 
@@ -523,6 +547,8 @@ async function logout() {
   await sb.auth.signOut();
   currentUser = null; currentProfile = null; isAdmin = false; catalogItems = [];
   document.getElementById("nav-admin-btn").classList.add("hidden");
+  document.getElementById("nav-staff-btn").classList.add("hidden");
+  document.getElementById("st-credentials").classList.add("hidden");
   document.getElementById("app").classList.add("hidden");
   document.getElementById("login-screen").classList.remove("hidden");
 }
@@ -551,6 +577,7 @@ async function afterLogin() {
   isAdmin = profile.is_super_admin === true;
   document.getElementById("who").textContent = currentProfile.full_name || currentUser.email;
   document.getElementById("nav-admin-btn").classList.toggle("hidden", !isAdmin);
+  document.getElementById("nav-staff-btn").classList.toggle("hidden", !isAdmin);
 
   await loadStaffList();
   document.getElementById("login-screen").classList.add("hidden");
@@ -563,11 +590,20 @@ async function afterLogin() {
 
 function showAdminView() {
   document.getElementById("quote-view").classList.add("hidden");
+  document.getElementById("staff-view").classList.add("hidden");
   document.getElementById("admin-view").classList.remove("hidden");
+}
+
+function showStaffView() {
+  document.getElementById("quote-view").classList.add("hidden");
+  document.getElementById("admin-view").classList.add("hidden");
+  document.getElementById("staff-view").classList.remove("hidden");
+  loadStaffAdmin();
 }
 
 function showQuoteView() {
   document.getElementById("admin-view").classList.add("hidden");
+  document.getElementById("staff-view").classList.add("hidden");
   document.getElementById("quote-view").classList.remove("hidden");
 }
 
@@ -1493,6 +1529,114 @@ async function voidInvoice(id) {
   const { error } = await sb.from("quote_invoices").update({ status: "void" }).eq("id", id);
   if (error) { alert("Couldn't void invoice — " + error.message); return; }
   loadInvoices();
+}
+
+// ---------- STAFF ADMIN ----------
+// All writes go through the `staff-admin` Edge Function (service role,
+// verifies the caller is a super admin of the same company). The browser
+// never touches auth.users directly.
+let staffAdminRows = [];
+
+async function staffApi(action, payload) {
+  const { data, error } = await sb.functions.invoke("staff-admin", { body: { action, ...payload } });
+  if (error) {
+    let msg = error.message || "Request failed";
+    try { const j = await error.context.json(); if (j && j.error) msg = j.error; } catch (_) {}
+    throw new Error(msg);
+  }
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+async function loadStaffAdmin() {
+  const el = document.getElementById("staff-admin-list");
+  const { data, error } = await sb.from("profiles")
+    .select("id, full_name, email, phone, active")
+    .eq("company_id", METRO_COMPANY_ID)
+    .order("full_name");
+  if (error) {
+    el.innerHTML = `<div class="saved-item"><span class="meta">Couldn't load staff — ${escapeHtml(error.message)}. Has staff.sql been run?</span></div>`;
+    return;
+  }
+  staffAdminRows = data || [];
+  if (!staffAdminRows.length) { el.innerHTML = `<div class="saved-item"><span class="meta">No staff yet.</span></div>`; return; }
+  el.innerHTML = "";
+  staffAdminRows.forEach(r => {
+    const inactive = r.active === false;
+    const row = document.createElement("div");
+    row.className = "admin-row";
+    row.style.opacity = inactive ? ".6" : "1";
+    row.innerHTML = `
+      <input type="text" data-f="name" value="${escapeHtml(r.full_name || "")}" placeholder="Name" style="flex:2;min-width:140px;" />
+      <div style="flex:2;min-width:160px;font-size:13px;color:#555;overflow-wrap:anywhere;">${escapeHtml(r.email || "—")}</div>
+      <input type="text" data-f="phone" value="${escapeHtml(r.phone || "")}" placeholder="Phone" style="flex:1;min-width:110px;" />
+      <span class="badge ${inactive ? "void" : "paid"}">${inactive ? "inactive" : "active"}</span>
+      <button class="btn ghost small" data-act="save">Save</button>
+      <button class="btn ghost small" data-act="reset">Reset password</button>
+      <button class="btn ghost small" data-act="toggle">${inactive ? "Reactivate" : "Deactivate"}</button>
+      <div class="admin-row-status" data-role="st"></div>`;
+    const st = row.querySelector('[data-role="st"]');
+    const say = (t, ok) => { st.textContent = t; st.className = "admin-row-status " + (ok ? "ok" : "err"); };
+    row.querySelector('[data-act="save"]').onclick = async () => {
+      try {
+        await staffApi("update", { user_id: r.id,
+          full_name: row.querySelector('[data-f="name"]').value.trim(),
+          phone: row.querySelector('[data-f="phone"]').value.trim() });
+        say("Saved", true); loadStaffList();
+      } catch (e) { say(e.message, false); }
+    };
+    row.querySelector('[data-act="reset"]').onclick = async () => {
+      if (!confirm(`Reset the password for ${r.full_name || r.email}? Their current password stops working.`)) return;
+      try {
+        const res = await staffApi("reset_password", { user_id: r.id });
+        showStaffCredentials(r.full_name || r.email, r.email, res.temp_password);
+      } catch (e) { say(e.message, false); }
+    };
+    row.querySelector('[data-act="toggle"]').onclick = async () => {
+      if (r.id === currentUser.id) { say("You can't deactivate your own login.", false); return; }
+      if (!inactive && !confirm(`Deactivate ${r.full_name || r.email}? They won't be able to sign in.`)) return;
+      try { await staffApi("set_active", { user_id: r.id, active: inactive }); loadStaffAdmin(); loadStaffList(); }
+      catch (e) { say(e.message, false); }
+    };
+    el.appendChild(row);
+  });
+}
+
+function showStaffCredentials(name, email, tempPassword) {
+  const box = document.getElementById("st-credentials");
+  box.innerHTML = `
+    <div style="font-weight:600;color:var(--teal-dark);margin-bottom:6px;">Login for ${escapeHtml(name)}</div>
+    <div>Email: <b>${escapeHtml(email)}</b></div>
+    <div>Temporary password: <b style="font-family:monospace;font-size:14px;">${escapeHtml(tempPassword)}</b></div>
+    <div style="color:#888;font-size:11px;margin-top:6px;">Shown once — copy it now and send it to them securely. Ask them to change it after first sign-in.</div>
+    <button class="btn ghost small" style="margin-top:8px;" onclick="copyStaffCredentials()">Copy email + password</button>`;
+  box.dataset.copy = `Email: ${email}\nTemporary password: ${tempPassword}`;
+  box.classList.remove("hidden");
+}
+
+function copyStaffCredentials() {
+  const box = document.getElementById("st-credentials");
+  navigator.clipboard.writeText(box.dataset.copy || "").catch(() => {});
+}
+
+async function addStaffMember() {
+  const st = document.getElementById("st-status");
+  const full_name = document.getElementById("st-name").value.trim();
+  const email = document.getElementById("st-email").value.trim().toLowerCase();
+  const phone = document.getElementById("st-phone").value.trim();
+  if (!full_name || !/^\S+@\S+\.\S+$/.test(email)) {
+    st.textContent = "Enter a name and a valid email."; st.className = "status err"; return;
+  }
+  st.textContent = "Creating..."; st.className = "status";
+  try {
+    const res = await staffApi("create", { full_name, email, phone });
+    st.textContent = "Login created"; st.className = "status ok";
+    showStaffCredentials(full_name, email, res.temp_password);
+    ["st-name", "st-email", "st-phone"].forEach(id => document.getElementById(id).value = "");
+    loadStaffAdmin(); loadStaffList();
+  } catch (e) {
+    st.textContent = "Couldn't create login — " + e.message; st.className = "status err";
+  }
 }
 
 // ---------- INIT ----------
